@@ -1,0 +1,665 @@
+```markdown
+# Fase 3: Inteligência Artificial Aprimorada com Processamento Local e Memória MCP - Especificação Técnica Revisada
+
+## 1. Visão Geral
+
+Esta fase eleva o nível de inteligência do chatbot, implementando análise contextual sofisticada, memória persistente entre sessões e processamento local via **Ollama** para reduzir custos operacionais. A arquitetura MCP é consolidada com a adição de **Servidores MCP dedicados** para o processamento local de NLP (`mcp-server-ollama`) e para o gerenciamento da memória (`mcp-server-memory`). O **Host MCP (Controlador Principal)** agora incorpora um **Router Inteligente** que direciona as tarefas para o servidor MCP apropriado (local ou remoto), mantendo alta qualidade de resposta e otimizando custos.
+
+## 2. Arquitetura (com Novos Servidores MCP Locais)
+
+### 2.1 Diagrama de Alto Nível (Fase 3 - Adição de Ollama e Memória MCP)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                Interface Terminal (main.py)                  │
+└───────────────────────────────┬─────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────┐
+│            Controlador Principal / **MCP Host**              │
+│             (core/app.py - ChatbotApp - Async)             │
+│ ┌───────────────────────────┐ ┌─────────────────────────┐ │
+│ │ **MCP Clients Internos**  │ │  **Router Inteligente** │ │
+│ │ (clients/*.py)            │ │  (Lógica no Host)       │ │
+│ └───────────▲─────────────┘ └───────────┬─────────────┘ │
+└───────────────│───────────────────────────│───────────────┘
+                │ (Chamadas MCP via stdio)  │
+┌───────────────┼───────────────────────────┼──────────────────────────────────┬───────────────────────────┐
+│               │                           │                                  │                           │
+│   ┌───────────▼───────────┐   ┌───────────▼───────────┐    ┌─────────────────▼──┐   ┌─────────────────▼──┐
+│   │**mcp-server-filesystem**│   │    **mcp-server-rag**   │    │**mcp-server-ollama** │   │ **mcp-server-memory**│
+│   │    (Fase 2)           │   │    (Fase 2)           │    │ (Novo - NLP Local) │   │ (Novo - Persist.)  │
+│   │  - Usa: DOCLING       │   │  - Usa: Qdrant Client,│    │ - Usa: Ollama Client│   │ - Usa: aiosqlite,  │
+│   │    python-magic        │   │    HF Embeddings/Local│    │ - Models: BERT/etc  │   │   qdrant-client   │
+│   └───────────┬───────────┘   └───────────┬───────────┘    └───────┬────────────┘   └───────┬─────────────┘
+│               │ (stdio)                   │ (stdio)              │ (stdio)                │ (stdio)
+└───────────────┴───────────────────────────┴──────────────────────┴────────────────────────┘
+                                                                     │ (Ollama API)           │ (SQLite/Qdrant)
+                                                              ┌──────▼──────┐         ┌───────▼───────┐
+                                                              │ Ollama Local│         │  SQLite/Qdrant  │
+                                                              └─────────────┘         └───────────────┘
+```
+
+### 2.2 Componentes Principais (Detalhado)
+
+1.  **Controlador Principal (Host)**: `core/app.py` - Orquestra, contém o Router Inteligente, gerencia MCP Clients.
+2.  **Router Inteligente (no Host)**: `core/router.py` (ou em `app.py`) - Analisa intenção/complexidade e decide qual MCP Client/Tool chamar.
+3.  **Servidor MCP: `mcp-server-ollama` (Novo)**: Executa modelos BERT/RoBERTa/Nomic locais via Ollama. Expõe Tools (`classify_intent`, `analyze_sentiment`, `extract_entities`, `generate_embedding`).
+4.  **Servidor MCP: `mcp-server-memory` (Novo)**: Gerencia memória (SQLite/Qdrant). Expõe Tools (`add_interaction`, `get_recent_context`, `search_memory`, `summarize_context`).
+5.  **Servidores MCP Existentes (Fase 2)**: `filesystem`, `rag`, `media`, `fetch`.
+
+### 2.3 Fluxo de Dados (Conforme descrito na revisão anterior)
+
+A lógica agora reside no Router dentro do Host, que escolhe o MCP Client (e, por consequência, o Servidor MCP) apropriado para cada subtarefa.
+
+## 3. Especificações Técnicas
+
+### 3.1 Estrutura do Projeto (Conforme Revisão Anterior)
+
+Adiciona diretórios `/mcp_servers/ollama_server` e `/mcp_servers/memory_server`, e clientes `src/clients/ollama.py` e `src/clients/memory.py`. Atualiza `embeddings_server` para usar Ollama.
+
+### 3.2 Stack Tecnológico (Conforme Revisão Anterior)
+
+-   **Processamento Local NLP**: `ollama` (biblioteca cliente Python), modelos BERT/RoBERTa/Nomic baixados no Ollama.
+-   **Persistência**: `aiosqlite`, `qdrant-client`.
+-   **Host/Roteamento**: Python, `mcp[cli]`.
+-   **Servidores MCP**: `FastMCP`.
+
+### 3.3 Implementação do Router Inteligente (no Host - `core/router.py`)
+
+Esta lógica decide para qual MCP Client direcionar a tarefa.
+
+```python
+# core/router.py (ou dentro de core/app.py)
+import logging
+import re
+from typing import Optional, Tuple, Dict, Any
+
+from clients.ollama import OllamaClient # Cliente MCP para o servidor Ollama
+from clients.rag import RAGClient
+from clients.memory import MemoryClient
+from clients.web import WebClient
+# Importar outros clientes MCP necessários (llm_api, etc.)
+
+from models.task import TaskType, TaskComplexity # Modelos Pydantic para tarefas
+from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+class IntelligentRouter:
+    def __init__(
+        self,
+        ollama_client: OllamaClient,
+        rag_client: RAGClient,
+        memory_client: MemoryClient,
+        web_client: WebClient,
+        # outros_clientes_mcp...
+    ):
+        self.ollama_client = ollama_client
+        self.rag_client = rag_client
+        self.memory_client = memory_client
+        self.web_client = web_client
+        # self.llm_api_client = llm_api_client # Cliente para Groq/HF API via MCP
+
+        # Limites de decisão (podem vir de settings)
+        self.complexity_threshold = settings.COMPLEXITY_THRESHOLD # Ex: 5
+        self.token_threshold = settings.TOKEN_THRESHOLD       # Ex: 100
+        self.local_tasks = { # Tarefas preferencialmente locais
+            TaskType.CLASSIFICATION, TaskType.SENTIMENT_ANALYSIS, TaskType.NER
+        }
+        self.api_tasks = { # Tarefas preferencialmente via API
+            TaskType.CREATIVE_GENERATION, TaskType.CODE_GENERATION, TaskType.REASONING
+        }
+
+        # Contadores (para exemplo /stats)
+        self.local_count = 0
+        self.api_count = 0
+
+    async def route_task(self, text: str) -> Tuple[str, Dict[str, Any]]:
+        """Decide como processar o texto e chama o MCP Client apropriado."""
+        metadata = {"input_text": text}
+        try:
+            # 1. Classificar Intenção (usando o servidor Ollama via MCP)
+            intent_result = await self.ollama_client.classify_intent(text, list(TaskType.__members__.keys()))
+            task_type = TaskType[intent_result.get("label", TaskType.GENERAL_QUERY.name)]
+            metadata["task_type"] = task_type.value
+            logger.info(f"Intenção detectada: {task_type}")
+
+            # 2. Determinar Complexidade (heurística simples, pode melhorar)
+            complexity = self._determine_complexity(text, task_type)
+            metadata["complexity"] = complexity.value
+
+            # 3. Decidir Roteamento
+            use_local = self._should_use_local(task_type, complexity)
+
+            # 4. Executar Tarefa via MCP Client
+            if use_local:
+                logger.info("Roteando para processamento local (Ollama MCP Server)")
+                result = await self._process_locally(text, task_type)
+                processor = "local (Ollama)"
+                self.local_count += 1
+            elif task_type == TaskType.RAG_QUERY:
+                 logger.info("Roteando para RAG (RAG MCP Server)")
+                 result = await self.rag_client.semantic_search(text) # Exemplo
+                 processor = "local (RAG)"
+                 self.local_count +=1 # Considerar RAG como local
+            elif task_type == TaskType.WEB_SEARCH:
+                 logger.info("Roteando para Web Search (Fetch MCP Server)")
+                 result = await self.web_client.search(text) # Exemplo
+                 processor = "external (Web)"
+                 self.api_count += 1 # Considerar Web como API
+            else:
+                logger.info("Roteando para processamento via API (LLM API MCP Server)")
+                # result = await self.llm_api_client.generate(text, model=settings.GROQ_MODEL_ID) # Exemplo
+                # Simulado por enquanto se llm_api_client não estiver implementado
+                result = f"(Simulado: API Externa processando: {text})"
+                processor = "external (API)"
+                self.api_count += 1
+
+            metadata["processor"] = processor
+            total = self.local_count + self.api_count
+            metadata["local_api_ratio"] = self.local_count / total if total > 0 else 0
+
+            return result, metadata
+
+        except Exception as e:
+            logger.error(f"Erro no roteamento: {e}", exc_info=True)
+            # Fallback muito simples
+            return f"Desculpe, ocorreu um erro interno ao processar: '{text}'", metadata
+
+    def _determine_complexity(self, text: str, task_type: TaskType) -> TaskComplexity:
+        # Lógica similar ao original, mas simplificada para exemplo
+        token_count = len(text.split())
+        if token_count < 50 and task_type not in self.api_tasks:
+            return TaskComplexity.SIMPLE
+        if token_count > self.token_threshold or task_type in self.api_tasks:
+            return TaskComplexity.COMPLEX
+        return TaskComplexity.MODERATE
+
+    def _should_use_local(self, task_type: TaskType, complexity: TaskComplexity) -> bool:
+         # Usar API para tarefas complexas ou explicitamente API-bound
+        if complexity == TaskComplexity.COMPLEX or task_type in self.api_tasks:
+            return False
+        # Usar local para tarefas simples/moderadas que são locais por natureza
+        if task_type in self.local_tasks:
+             # Aqui poderia verificar se o mcp-server-ollama está disponível/respondendo
+            return True
+        # Default para API (ou poderia ser local dependendo da estratégia)
+        return False
+
+    async def _process_locally(self, text: str, task_type: TaskType) -> str:
+        """Chama a tool apropriada no mcp-server-ollama."""
+        try:
+            if task_type == TaskType.CLASSIFICATION:
+                # Exemplo: labels podem vir de config ou serem mais dinâmicas
+                labels = ["pergunta_tecnica", "conversa_geral", "comando"]
+                result = await self.ollama_client.classify_intent(text, labels)
+                return f"Classificação Local: {result.get('label')} (Conf: {result.get('score', 0):.2f})"
+            elif task_type == TaskType.SENTIMENT_ANALYSIS:
+                result = await self.ollama_client.analyze_sentiment(text)
+                return f"Sentimento Local: {result.get('label')} (Conf: {result.get('score', 0):.2f})"
+            elif task_type == TaskType.NER:
+                result = await self.ollama_client.extract_entities(text)
+                entities_str = ", ".join([f"{e['word']}({e['entity_group']})" for e in result])
+                return f"Entidades Locais: {entities_str or 'Nenhuma'}"
+            # Adicionar outras tarefas locais (summarize, QA simples) se implementadas no server
+            else:
+                # Fallback - deveria idealmente ir para API, mas como estamos no _process_locally...
+                return f"(Tarefa local {task_type.value} não implementada para '{text}')"
+        except Exception as e:
+            logger.error(f"Erro no processamento local MCP: {e}", exc_info=True)
+            return f"(Erro ao processar localmente: {e})"
+
+```
+
+### 3.4 Implementação do `mcp-server-ollama/src/server.py`
+
+Este servidor expõe as tools NLP locais.
+
+```python
+# /mcp_servers/ollama_server/src/server.py
+import logging
+from typing import List, Dict, Any
+from mcp.server.fastmcp import FastMCP, Context
+import ollama # Biblioteca cliente Ollama
+from core.config import settings # Acessar nomes dos modelos do .env
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+mcp = FastMCP(name="Ollama NLP Server")
+
+# --- Helpers para interagir com Ollama ---
+async def _call_ollama(model: str, prompt: str, format: str = "") -> Dict[str, Any]:
+    """Função helper para chamar a API Ollama."""
+    try:
+        logger.info(f"Chamando Ollama model={model} format={format}")
+        response = await ollama.AsyncClient().chat(
+            model=model,
+            messages=[{'role': 'user', 'content': prompt}],
+            format=format # Para respostas JSON
+        )
+        logger.debug(f"Resposta Ollama: {response}")
+        # A resposta do chat contém a mensagem sob 'message' > 'content'
+        content = response.get('message', {}).get('content', '{}')
+        if format == 'json':
+            import json
+            return json.loads(content)
+        return {"response": content} # Retorna como dict para consistência
+    except Exception as e:
+        logger.error(f"Erro ao chamar Ollama ({model}): {e}")
+        raise ConnectionError(f"Falha ao comunicar com Ollama: {e}")
+
+# --- MCP Tools ---
+@mcp.tool()
+async def classify_intent(text: str, labels: List[str], ctx: Context) -> Dict[str, Any]:
+    """Classifica a intenção do texto usando um modelo local."""
+    model = settings.OLLAMA_INTENT_MODEL # Ex: 'bert-base' adaptado/finetunado para classificação
+    prompt = f"""Classifique o texto a seguir em uma das seguintes categorias: {', '.join(labels)}.
+    Texto: "{text}"
+    Retorne APENAS o nome da categoria mais provável."""
+    # Idealmente, usaríamos um modelo treinado para classificação,
+    # aqui simulamos com um prompt para um modelo de chat genérico.
+    # Para um modelo real bert/roberta, a chamada seria diferente (não chat).
+    # A API Ollama pode ter formas de carregar e usar modelos específicos de tarefas.
+    # Esta implementação é uma simplificação para o exemplo.
+    try:
+        # Simulação - um modelo real retornaria scores, etc.
+        response = await _call_ollama(model, prompt)
+        best_label = response.get("response", "").strip()
+        # Lógica básica para encontrar a label mais próxima se não for exata
+        if best_label not in labels:
+             # Tentar encontrar a melhor correspondência (pode precisar de fuzzy matching)
+             best_label = labels[0] # Fallback simples
+        return {"label": best_label, "score": 0.9} # Score fixo para exemplo
+    except Exception as e:
+        ctx.error(f"Erro na classificação de intenção: {e}")
+        return {"label": "unknown", "score": 0.0, "error": str(e)}
+
+@mcp.tool()
+async def analyze_sentiment(text: str, ctx: Context) -> Dict[str, Any]:
+    """Analisa o sentimento do texto."""
+    model = settings.OLLAMA_SENTIMENT_MODEL # Ex: 'distilbert-sst2'
+    prompt = f"""Analise o sentimento do texto a seguir (positivo, negativo, neutro).
+    Texto: "{text}"
+    Retorne APENAS 'positivo', 'negativo' ou 'neutro'."""
+    try:
+        # Simulação - um modelo real retornaria scores
+        response = await _call_ollama(model, prompt)
+        label = response.get("response", "neutro").strip().lower()
+        if label not in ["positivo", "negativo", "neutro"]:
+             label = "neutro" # Fallback
+        return {"label": label, "score": 0.85} # Score fixo
+    except Exception as e:
+        ctx.error(f"Erro na análise de sentimento: {e}")
+        return {"label": "unknown", "score": 0.0, "error": str(e)}
+
+@mcp.tool()
+async def extract_entities(text: str, ctx: Context) -> List[Dict[str, Any]]:
+    """Extrai entidades nomeadas do texto."""
+    model = settings.OLLAMA_NER_MODEL # Ex: 'bert-ner' adaptado
+    prompt = f"""Extraia entidades nomeadas (Pessoa, Local, Organização) do texto.
+    Texto: "{text}"
+    Responda APENAS com um JSON Array no formato [{"entity_group": "TIPO", "word": "palavra"}]. Ex: [{"entity_group": "PER", "word": "Maria"}]"""
+    try:
+        # Modelos NER geralmente requerem processamento específico, não chat.
+        # Simulando com um modelo de chat + JSON format.
+        response = await _call_ollama(model, prompt, format='json')
+        # A resposta já deve ser um dict (lista) devido ao format='json'
+        if isinstance(response, list):
+            return response
+        else:
+            ctx.warning(f"Resposta inesperada do NER: {response}")
+            return []
+    except Exception as e:
+        ctx.error(f"Erro na extração de entidades: {e}")
+        return [{"error": str(e)}]
+
+# Adicionar tool para embeddings
+@mcp.tool()
+async def generate_embedding(text: str, ctx: Context) -> List[float]:
+     """Gera embedding para o texto usando modelo local."""
+     model = settings.OLLAMA_EMBEDDING_MODEL # Ex: 'nomic-embed-text'
+     try:
+         logger.info(f"Gerando embedding local para texto de {len(text)} chars")
+         # A biblioteca ollama tem um método específico para embeddings
+         response = await ollama.AsyncClient().embeddings(model=model, prompt=text)
+         embedding = response.get("embedding", [])
+         logger.info(f"Embedding gerado com dimensão: {len(embedding)}")
+         return embedding
+     except Exception as e:
+         ctx.error(f"Erro ao gerar embedding local: {e}")
+         return []
+
+if __name__ == "__main__":
+    # Garante que as variáveis de ambiente sejam carregadas se rodar diretamente
+    from dotenv import load_dotenv
+    load_dotenv()
+    mcp.run() # Roda via stdio por padrão
+```
+
+### 3.5 Implementação do `mcp-server-memory/src/server.py`
+
+Este servidor gerencia a memória usando SQLite e Qdrant, expondo tools via MCP.
+
+```python
+# /mcp_servers/memory_server/src/server.py
+import asyncio
+import logging
+import json
+import uuid
+from datetime import datetime, timedelta
+import aiosqlite
+from typing import List, Dict, Any, Optional
+
+from mcp.server.fastmcp import FastMCP, Context
+from qdrant_client import QdrantClient, models # Importa Qdrant
+from core.config import settings # Acessar paths, thresholds
+# Assume que temos um cliente MCP para chamar o servidor de embeddings
+from clients.embeddings import EmbeddingsClient # Cliente MCP
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+mcp = FastMCP(name="Memory Server")
+
+# --- Clientes e Configurações ---
+# Assume que Qdrant está rodando localmente
+qdrant_client = QdrantClient(url=settings.QDRANT_URL)
+COLLECTION_NAME = settings.QDRANT_COLLECTION
+DB_PATH = settings.SQLITE_PATH
+# Cliente para o servidor de embeddings MCP (precisa ser inicializado no lifespan)
+embeddings_client: Optional[EmbeddingsClient] = None
+
+# --- Helpers do Banco de Dados ---
+async def setup_database():
+    """Cria tabelas SQLite se não existirem."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS short_term_memory (
+            id TEXT PRIMARY KEY, timestamp TEXT, role TEXT, content TEXT,
+            metadata TEXT, importance REAL, last_accessed TEXT
+        )''')
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS long_term_memory_index (
+            id TEXT PRIMARY KEY, timestamp TEXT, content_summary TEXT,
+            metadata TEXT, importance REAL, access_count INTEGER, last_accessed TEXT
+        )''') # Apenas metadados no SQLite, vetores no Qdrant
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_stm_ts ON short_term_memory(timestamp)')
+        await db.commit()
+    # Garantir coleção Qdrant
+    try:
+        qdrant_client.get_collection(collection_name=COLLECTION_NAME)
+    except Exception: # Pode ser mais específico
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=settings.EMBEDDING_DIMENSIONS, distance=models.Distance.COSINE)
+        )
+    logger.info("Banco de dados da memória (SQLite/Qdrant) inicializado.")
+
+@mcp._mcp_server.lifespan # Usando o lifespan do servidor MCP low-level
+@asynccontextmanager
+async def lifespan(server: MCPServer) -> AsyncIterator[Dict]:
+    """Gerencia a inicialização e limpeza dos recursos da memória."""
+    global embeddings_client
+    await setup_database()
+    # Inicializa o cliente para o servidor de embeddings
+    embeddings_client = EmbeddingsClient(settings.EMBEDDINGS_SERVER_CMD)
+    async with embeddings_client.connect(): # Mantém conexão ativa
+        yield {"qdrant": qdrant_client, "sqlite_path": DB_PATH, "embed_client": embeddings_client}
+    logger.info("Recursos da memória limpos.")
+
+# --- MCP Tools ---
+@mcp.tool()
+async def add_interaction(role: str, content: str, metadata: Dict[str, Any] = {}, ctx: Context) -> str:
+    """Adiciona uma interação à memória de curto prazo (SQLite)."""
+    memory_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
+    importance = _calculate_importance(content) # Helper
+    metadata_json = json.dumps(metadata or {})
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                'INSERT INTO short_term_memory VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (memory_id, timestamp, role, content, metadata_json, importance, timestamp)
+            )
+            await db.commit()
+        ctx.info(f"Interação adicionada à memória de curto prazo: ID {memory_id}")
+        # TODO: Adicionar lógica de consolidação periódica ou por gatilho
+        return memory_id
+    except Exception as e:
+        ctx.error(f"Erro ao adicionar interação: {e}")
+        raise ToolError(f"Falha ao salvar interação: {e}") from e
+
+@mcp.tool()
+async def get_recent_context(limit: int = 10, ctx: Context) -> List[Dict[str, Any]]:
+    """Recupera as interações mais recentes da memória de curto prazo."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                'SELECT id, timestamp, role, content, metadata FROM short_term_memory ORDER BY timestamp DESC LIMIT ?',
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            results = [dict(row) for row in rows]
+            # Deserializar metadata
+            for res in results:
+                res["metadata"] = json.loads(res["metadata"])
+            return results
+    except Exception as e:
+        ctx.error(f"Erro ao buscar contexto recente: {e}")
+        return []
+
+@mcp.tool()
+async def search_memory(query_text: str, limit: int = 5, ctx: Context) -> List[Dict[str, Any]]:
+    """Busca na memória de longo prazo (Qdrant) por similaridade semântica."""
+    global embeddings_client
+    if not embeddings_client:
+        raise ToolError("Cliente de Embeddings não inicializado.")
+
+    try:
+        # 1. Gerar embedding para a query (chamando o outro servidor MCP)
+        query_vector = await embeddings_client.generate_embedding(query_text)
+        if not query_vector:
+            raise ToolError("Falha ao gerar embedding para a busca.")
+
+        # 2. Buscar no Qdrant
+        search_result = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            limit=limit,
+            with_payload=True
+        )
+
+        # 3. Formatar resultados
+        results = [
+            {"id": hit.id, "score": hit.score, **(hit.payload or {})}
+            for hit in search_result
+        ]
+        # TODO: Poderia incluir busca por keyword no SQLite (curto prazo) também
+        return results
+    except Exception as e:
+        ctx.error(f"Erro na busca de memória: {e}")
+        return []
+
+# --- Funções Helper (Internas ao servidor) ---
+def _calculate_importance(content: str) -> float:
+    """Calcula a importância inicial de uma memória (heurística simples)."""
+    # Lógica similar ao exemplo original
+    length_factor = min(len(content) / 500, 1.0) * 0.3
+    question_factor = 0.2 if '?' in content else 0
+    action_words = ['lembrar', 'fazer', 'criar', 'implementar']
+    action_factor = 0.3 if any(word in content.lower() for word in action_words) else 0
+    importance = 0.5 + length_factor + question_factor + action_factor
+    return min(importance, 1.0)
+
+# TODO: Implementar _consolidate_memories() para mover de SQLite para Qdrant
+# async def _consolidate_memories(): ...
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+    # Roda o servidor via stdio
+    mcp.run()```
+
+### 3.6 Configurações de Ambiente (`.env` - Conforme Revisão Anterior)
+
+As configurações adicionadas na revisão anterior para `OLLAMA_`, `SQLITE_PATH`, `QDRANT_`, `ROUTER_` e `MEMORY_` são cruciais.
+
+### 3.7 `pyproject.toml` (Conforme Revisão Anterior)
+
+Adicionar as dependências `ollama` para `ollama_server`, e `aiosqlite`, `qdrant-client` para `memory_server`.
+
+## 4. Testes (Adaptados para MCP)
+
+### 4.1 Testes do Router Inteligente (no Host)
+
+Os testes devem mockar os **MCP Clients** (`ollama_client`, `rag_client`, etc.) e verificar se o Router chama o método correto no cliente correto com base na entrada.
+
+```python
+# tests/host/test_router.py (exemplo conceitual)
+import pytest
+from unittest.mock import AsyncMock
+from core.router import IntelligentRouter
+from models.task import TaskType, TaskComplexity # Seus modelos
+
+# ... (fixtures para mockar clientes MCP) ...
+
+@pytest.mark.asyncio
+async def test_route_simple_sentiment_to_ollama(router, mock_ollama_client):
+    text = "Eu adorei isso!"
+    # Mockar a primeira chamada de classificação de intenção
+    mock_ollama_client.classify_intent.return_value = {"label": "SENTIMENT_ANALYSIS"}
+    mock_ollama_client.analyze_sentiment.return_value = {"label": "positivo", "score": 0.9}
+
+    result, metadata = await router.route_task(text)
+
+    assert metadata["processor"] == "local (Ollama)"
+    assert "Sentimento Local: positivo" in result
+    mock_ollama_client.classify_intent.assert_called_once()
+    mock_ollama_client.analyze_sentiment.assert_called_once_with(text)
+    # Verificar que outros clientes não foram chamados
+```
+
+### 4.2 Testes do `mcp-server-ollama`
+
+Testes unitários mockando a biblioteca `ollama`. Testes de integração conectando ao servidor MCP via `mcp.shared.memory.create_connected_server_and_client_session` e verificando se as *tools* retornam o esperado (requer instância Ollama real).
+
+```python
+# tests/mcp_servers/ollama/test_server.py (exemplo conceitual)
+import pytest
+from unittest.mock import AsyncMock, patch
+# Importar o server real de mcp_servers.ollama_server.src.server
+from mcp_servers.ollama_server.src.server import mcp as ollama_server_mcp # Renomear para evitar conflito
+from mcp.shared.memory import create_connected_server_and_client_session
+
+@pytest.mark.asyncio
+async def test_ollama_server_classify_intent_tool():
+    # Mock da chamada interna ao ollama.AsyncClient().chat
+    mock_ollama_response = {"message": {"content": "conversa_geral"}}
+    with patch('ollama.AsyncClient.chat', return_value=mock_ollama_response):
+        async with create_connected_server_and_client_session(ollama_server_mcp._mcp_server) as client:
+            result = await client.call_tool(
+                "classify_intent",
+                {"text": "oi como vai?", "labels": ["conversa_geral", "pergunta_tecnica"]}
+            )
+            assert not result.isError
+            content = result.content[0].text # Assume TextContent
+            # Resultado depende da lógica de parsing no server
+            assert '"label": "conversa_geral"' in content
+```
+
+### 4.3 Testes do `mcp-server-memory`
+
+Testes unitários mockando `aiosqlite` e `qdrant-client`. Testes de integração conectando ao servidor MCP e verificando as *tools* de memória (requer SQLite e Qdrant reais).
+
+```python
+# tests/mcp_servers/memory/test_server.py (exemplo conceitual)
+import pytest
+from unittest.mock import AsyncMock, patch
+# Importar o server real de mcp_servers.memory_server.src.server
+from mcp_servers.memory_server.src.server import mcp as memory_server_mcp # Renomear
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import TextContent
+import uuid
+
+@pytest.fixture(autouse=True)
+async def mock_embeddings_client():
+     # Mock do cliente MCP para o servidor de embeddings, pois memory_server depende dele
+    mock_client = AsyncMock()
+    mock_client.generate_embedding = AsyncMock(return_value=[0.1] * 768) # Exemplo de dimensão
+    # Patch onde o cliente é instanciado/usado no memory_server
+    with patch('mcp_servers.memory_server.src.server.EmbeddingsClient', return_value=mock_client):
+        yield mock_client
+
+@pytest.mark.asyncio
+async def test_memory_server_add_and_get():
+     # Mock dos clientes de BD (pode ser mais elaborado)
+    with patch('aiosqlite.connect') as mock_sqlite, \
+         patch('qdrant_client.QdrantClient') as mock_qdrant:
+
+        # Configurar mocks para simular escritas/leituras
+        mock_conn = AsyncMock()
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall.return_value = [
+            # Simular linha retornada pelo SELECT em get_recent_context
+             (str(uuid.uuid4()), '2024-01-01T10:00:00', 'user', 'Mensagem de teste', '{}')
+        ]
+        mock_conn.execute.return_value = mock_cursor
+        mock_conn.__aenter__.return_value = mock_conn # Para 'async with'
+        mock_sqlite.return_value = mock_conn
+
+        mock_qdrant_instance = mock_qdrant.return_value
+        mock_qdrant_instance.search = AsyncMock(return_value=[]) # Mock da busca Qdrant
+
+        async with create_connected_server_and_client_session(memory_server_mcp._mcp_server) as client:
+            # 1. Adicionar interação
+            memory_id_result = await client.call_tool(
+                "add_interaction",
+                {"role": "user", "content": "Mensagem de teste"}
+            )
+            assert not memory_id_result.isError
+            memory_id = memory_id_result.content[0].text
+            assert isinstance(uuid.UUID(memory_id), uuid.UUID) # Verificar se é um UUID válido
+
+            # 2. Buscar contexto recente
+            context_result = await client.call_tool("get_recent_context", {"limit": 5})
+            assert not context_result.isError
+            # O resultado da tool é uma lista de dicts, convertida para TextContent(json_string)
+            context_list_json = context_result.content[0].text
+            import json
+            context_list = json.loads(context_list_json)
+            assert len(context_list) == 1
+            assert context_list[0]["content"] == "Mensagem de teste"
+
+            # 3. Buscar na memória (deve chamar embedding e Qdrant mockado)
+            search_results = await client.call_tool("search_memory", {"query_text": "teste"})
+            assert not search_results.isError
+            search_list_json = search_results.content[0].text
+            search_list = json.loads(search_list_json)
+            assert len(search_list) == 0 # Qdrant mockado retornou vazio
+            # Verificar se embeddings_client foi chamado (via mock)
+            # (acessar o mock_embeddings_client injetado no fixture)
+
+```
+
+## 5. Integração da Fase 3 com Fase 2 (Conforme Revisão Anterior)
+
+- O Host usa os novos clientes MCP para Ollama e Memória.
+- A lógica do Router Inteligente direciona as chamadas.
+- O servidor RAG agora chama o servidor de Embeddings (que usa Ollama).
+
+## 6. Plano de Implementação (Conforme Revisão Anterior)
+
+- Priorizar setup do Ollama e refatoração do servidor de Embeddings.
+- Implementar `mcp-server-ollama` e `mcp-server-memory` incrementalmente.
+- Desenvolver o Router Inteligente e integrar no Host.
+
+## 7. Riscos e Mitigações (Conforme Revisão Anterior)
+
+- Focar nos riscos de performance do Ollama e complexidade do Router.
+
+## 8. Conclusão (Mantida)
+
+A Fase 3 solidifica a arquitetura MCP com servidores locais para NLP e memória, otimizando custos e desempenho. O Router Inteligente no Host é a peça central para orquestrar essas novas capacidades. A inclusão de exemplos de código detalhados nesta especificação garante um guia claro para a implementação.

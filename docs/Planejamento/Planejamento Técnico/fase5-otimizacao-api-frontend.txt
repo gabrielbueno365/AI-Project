@@ -1,0 +1,676 @@
+```markdown
+# Fase 5: Otimização, API FastAPI e Preparação Frontend - Especificação Técnica Revisada
+
+## 1. Visão Geral
+
+Esta fase final transforma o chatbot de uma aplicação de terminal para um serviço web completo, otimizado para performance e custo. O foco principal é:
+
+1.  **Expor a funcionalidade completa** do chatbot (incluindo agentes e todos os servidores MCP) através de uma **API RESTful robusta usando FastAPI**.
+2.  Implementar **otimizações significativas** (caching, compressão de embeddings, batching).
+3.  Estabelecer uma **arquitetura de backend pronta para produção** que possa servir um frontend web moderno (a ser desenvolvido separadamente ou em uma fase futura).
+4.  Refinar o **monitoramento e logging**.
+
+A arquitetura MCP existente é fundamental, com o FastAPI atuando como o **Host MCP** principal, orquestrando as interações com os servidores MCP via MCP Clients.
+
+## 2. Arquitetura (API FastAPI como Host MCP)
+
+### 2.1 Diagrama de Alto Nível (Fase 5 - API e Otimização)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│               Frontend Web (Ex: React/Next.js)               │
+│                  (Desenvolvimento Futuro)                    │
+└───────────────────────────────┬──────────────────────────────┘
+                                │ (HTTP REST Calls)
+┌───────────────────────────────▼──────────────────────────────┐
+│                      **API RESTful (FastAPI)**               │
+│                     **(Atua como MCP Host)**                 │
+│ ┌────────────┐ ┌───────────┐ ┌──────────┐┌───────────────┐│
+│ │ Endpoints  │ │ Autentic. │ │ **Otimiz.**││**MCP Clients**││
+│ │ (chat,    │ │ (JWT)     │ │ (Cache,..)││ (clients/*.py)││
+│ │  docs,...)│ │           │ │           │└──────▲────────┘│
+│ └─────┬──────┘ └─────┬─────┘ └─────┬────┘       │          │
+└───────│──────────────│─────────────│────────────│──────────┘
+        │              │             │            │ (Chamadas MCP via stdio/http)
+        │              │             │┌───────────▼───────────────────────────┐
+        │              │             ││ **Camada de Servidores MCP**          │
+        │              │             ││┌─────────┐ ┌─────┐ ┌──────┐ ┌──────┐ │
+        │              │             │││ Filesys │ │ RAG │ │Ollama│ │Memory│ │.. (Fetch, Media, Meta, Pers)
+        │              │             ││└─────────┘ └─────┘ └──────┘ └──────┘ │
+        │              │             │└───────────────────────────────────────┘
+┌───────▼──────────────┴──────┬──────┴───────────────────────────────────────┐
+│    Middleware (Logging, CORS, Métricas) & Infra (Uvicorn, Docker?)          │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Componentes Principais (Atualizado)
+
+1.  **API RESTful (FastAPI)**: (`src/api/main.py`, `src/api/routers/*.py`) - O novo ponto de entrada principal. Define os endpoints HTTP (ex: `/chat`, `/upload`, `/memory_search`). **Atua como o Host MCP**, contendo a lógica de orquestração (Orchestrator da Fase 4) e gerenciando os MCP Clients.
+2.  **Autenticação (API)**: (`src/auth/auth.py`) - Implementa autenticação baseada em token (ex: JWT) para proteger os endpoints da API.
+3.  **Camada de Otimização**: (`src/optimization/*.py`) - Módulos para caching (ex: usando Redis ou `cachetools`), compressão de embeddings (PCA via `scikit-learn`), rate limiting (`slowapi`).
+4.  **MCP Clients (no Host)**: (`src/clients/*.py`) - Mantidos e agora utilizados pelos handlers dos endpoints FastAPI para se comunicar com os servidores MCP. A inicialização e ciclo de vida deles precisam ser gerenciados pelo FastAPI (ex: via `lifespan` ou dependências).
+5.  **Servidores MCP (Processos Separados)**: Todos os servidores desenvolvidos nas fases anteriores (`filesystem`, `rag`, `ollama`, `memory`, `metacognition`, `personality`, `embeddings`, `media`) e o `fetch` server (via npx/docker). São iniciados e gerenciados separadamente do processo da API FastAPI (podem ser processos locais, containers Docker, etc.).
+6.  **Monitoramento/Logging**: (`src/logging/*.py`) - Integração com o logging do FastAPI, potencialmente enviando logs estruturados para um sistema centralizado e expondo métricas (Prometheus).
+
+### 2.3 Fluxo de Dados (Exemplo: Chat via API)
+
+1.  Frontend envia `POST /api/chat/message` com `{"message": "Resuma este documento"}` e anexa um arquivo ou URI.
+2.  **Endpoint FastAPI (`api/routers/chat.py`)** recebe a requisição, valida o token JWT.
+3.  Handler do endpoint FastAPI (atuando como Host MCP):
+    *   Usa o `FilesystemClient` para chamar `tool: write_file` ou `tool: read_file` no `mcp-server-filesystem` (se for upload/URI).
+    *   Usa o `RAGClient` para chamar `tool: index_uri` no `mcp-server-rag`.
+    *   Usa o `RAGClient` para chamar `tool: semantic_search` (ou similar) para buscar contexto relevante.
+    *   Usa o **Orchestrator/Router** para decidir como gerar a resposta (ex: chamar LLM via `LLMApiClient` ou `OllamaClient`).
+    *   (Opcional) Usa o `PersonalityClient` para formatar a resposta.
+    *   Usa o `MemoryClient` para salvar a interação.
+4.  **Cache (Otimização)** é verificado/atualizado em etapas apropriadas (ex: cache de resposta LLM).
+5.  Endpoint FastAPI retorna a resposta JSON para o Frontend.
+
+## 3. Especificações Técnicas
+
+### 3.1 Estrutura do Projeto (Final)
+
+```
+/chatbot
+├── /src
+│   ├── /api                  # **Novo: Código da API FastAPI**
+│   │   ├── __init__.py
+│   │   ├── main.py           # Aplicação FastAPI principal + Lifespan
+│   │   ├── dependencies.py   # Injeção de dependências (ex: get_mcp_clients)
+│   │   ├── middleware.py     # Middlewares (Prometheus, Logging)
+│   │   └── /routers          # Endpoints por funcionalidade
+│   │       ├── __init__.py
+│   │       ├── chat.py       # Endpoints de chat (/chat/message, /chat/history)
+│   │       ├── documents.py  # Endpoints de docs (/documents/upload, /index)
+│   │       ├── media.py      # Endpoints de mídia (/media/transcribe)
+│   │       ├── memory.py     # Endpoints de memória (/memory/search)
+│   │       └── agents.py     # Endpoints para tarefas de agente (opcional)
+│   ├── /core                 # Lógica de Negócio (Orchestrator, Router)
+│   │   ├── app.py            # Pode conter lógica de inicialização/config
+│   │   ├── orchestrator.py   # Orquestrador (chama router/agentes)
+│   │   └── router.py         # Router Inteligente
+│   │   # ... (config, logging)
+│   ├── /clients              # **Clientes MCP (para Servidores Externos)**
+│   │   ├── base_client.py
+│   │   └── ... (filesystem.py, rag.py, ollama.py, etc.)
+│   ├── /models               # Modelos Pydantic (para API e internos)
+│   ├── /optimization         # **Novo: Módulos de Otimização**
+│   │   ├── __init__.py
+│   │   ├── caching.py        # Lógica de Cache (Redis/Memory)
+│   │   ├── compression.py    # Compressão de Embeddings (PCA)
+│   │   └── rate_limiter.py   # Configuração do Rate Limiter
+│   ├── /auth                 # **Novo: Autenticação API**
+│   │   ├── __init__.py
+│   │   ├── auth.py           # Funções JWT, dependência get_current_user
+│   │   └── models.py         # Modelos User, Token Pydantic
+│   ├── /utils                # (Mantido)
+│   └── (main.py - removido ou adaptado para CLI de gerenciamento)
+├── /mcp_servers            # (Mantidos - agora são processos/containers separados)
+│   ├── /filesystem_server
+│   └── ...
+├── /tests
+│   ├── /api                  # **Novo: Testes para a API FastAPI**
+│   │   ├── /routers
+│   │   └── ...
+│   ├── /host               # Testes para core (orchestrator, router)
+│   ├── /clients            # Testes para os clientes MCP
+│   ├── /optimization       # **Novo: Testes para otimizações**
+│   └── ... (testes mcp_servers mantidos, mas rodados separadamente)
+├── /deployment             # **Novo: Configs de Deploy**
+│   ├── docker-compose.yml  # (Opcional) Para rodar API + Servers
+│   ├── Dockerfile.api      # Dockerfile para a API FastAPI
+│   └── nginx.conf          # (Opcional) Exemplo de config Nginx
+├── .env                    # Variáveis de ambiente (API, Servers, etc.)
+# ... (Restante mantido: pyproject.toml do host, README, etc.)
+```
+
+### 3.2 Stack Tecnológico (Final)
+
+-   **API Backend**: **FastAPI**, **Uvicorn**, `Pydantic` (para modelos de request/response), `python-jose[cryptography]` (para JWT), `passlib[bcrypt]` (para hashing de senha).
+-   **Otimização**: `redis` (cliente async, se usar Redis cache), `cachetools` (para cache em memória), `scikit-learn` (para PCA), `slowapi` (para rate limiting).
+-   **Monitoramento**: `prometheus-fastapi-instrumentator` (métricas Prometheus), logging padrão Python + FastAPI.
+-   **Comunicação MCP**: **`mcp[cli]`** (usado pelos clientes MCP).
+-   **Servidores MCP**: Stacks definidos nas fases anteriores (Python, FastMCP, Qdrant, Ollama, Docling, FFmpeg, etc.).
+-   **Containerização (Opcional)**: Docker, Docker Compose.
+-   **Qualidade/Testes**: Mantidos (`pytest`, `httpx` para testar API, etc.).
+
+### 3.3 Implementação da API RESTful (`src/api/`)
+
+#### `main.py`: Aplicação FastAPI e Lifespan
+
+```python
+# src/api/main.py
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+
+from core.config import settings
+from core.orchestrator import Orchestrator
+from clients.base_client import initialize_mcp_clients, shutdown_mcp_clients, MCPClients
+from api.routers import chat, documents # , memory, etc.
+from optimization.caching import setup_cache # Importar setup de cache
+
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Setup Inicialização
+    logger.info("Iniciando API e Clientes MCP...")
+    # Configurar Cache (ex: conectar ao Redis)
+    await setup_cache()
+    # Inicializar e conectar clientes MCP (gerenciados externamente ou via lifespan)
+    mcp_clients = await initialize_mcp_clients(settings) # Função para iniciar conexões
+    app.state.mcp_clients = mcp_clients
+    app.state.orchestrator = Orchestrator(mcp_clients) # Passar clientes para o orquestrador
+    logger.info("API pronta.")
+    yield
+    # Setup Desligamento
+    logger.info("Desligando API e Clientes MCP...")
+    await shutdown_mcp_clients(app.state.mcp_clients)
+    logger.info("API desligada.")
+
+app = FastAPI(
+    title="Chatbot Inteligente API",
+    version="1.0.0",
+    lifespan=lifespan # Usar o lifespan manager
+)
+
+# Middlewares
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS, # Ler do .env
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Middleware de Métricas Prometheus
+Instrumentator().instrument(app).expose(app)
+
+# Incluir Routers
+app.include_router(chat.router, prefix="/chat", tags=["Chat"])
+app.include_router(documents.router, prefix="/documents", tags=["Documents"])
+# app.include_router(memory.router, prefix="/memory", tags=["Memory"])
+# ... incluir outros routers
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    # Adicionar verificações de conexão com MCP servers se necessário
+    return {"status": "ok"}
+
+# Adicionar endpoint de autenticação /token (ver 3.6)
+from auth.auth import router as auth_router
+app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+
+```
+
+#### `routers/chat.py`: Exemplo de Endpoint
+
+```python
+# src/api/routers/chat.py
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from pydantic import BaseModel
+from typing import Dict, Any
+
+# Importar dependências e lógica do core/orchestrator
+from core.orchestrator import Orchestrator
+from api.dependencies import get_orchestrator # Função para injetar o orquestrador
+from auth.auth import get_current_user # Dependência de autenticação
+from auth.models import User # Modelo Pydantic do usuário
+
+router = APIRouter()
+
+class ChatMessageInput(BaseModel):
+    message: str
+    session_id: str | None = None # Para manter contexto entre chamadas API
+
+class ChatMessageOutput(BaseModel):
+    response: str
+    session_id: str
+    metadata: Dict[str, Any] = {} # Informações extras (ex: sources RAG)
+
+@router.post("/message", response_model=ChatMessageOutput)
+async def handle_chat_message(
+    chat_input: ChatMessageInput,
+    request: Request, # Para acessar o estado da app (clientes, orquestrador)
+    # orchestrator: Orchestrator = Depends(get_orchestrator), # Injeção de dependência
+    current_user: User = Depends(get_current_user) # Protege o endpoint
+):
+    """Recebe uma mensagem do usuário e retorna a resposta do chatbot."""
+    orchestrator: Orchestrator = request.app.state.orchestrator
+    try:
+        # Passar ID do usuário e session_id para o orchestrator manter contexto
+        user_context = {"user_id": current_user.username, "session_id": chat_input.session_id}
+        response_text, metadata = await orchestrator.process_user_message(
+            text=chat_input.message,
+            context=user_context
+        )
+
+        # Atualizar/Gerar session_id se necessário
+        new_session_id = metadata.get("session_id", chat_input.session_id or "new_session")
+
+        return ChatMessageOutput(
+            response=response_text,
+            session_id=new_session_id,
+            metadata=metadata # Incluir dados como sources, etc.
+        )
+    except Exception as e:
+        logging.exception("Erro ao processar mensagem de chat na API") # Log completo
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao processar mensagem: {e}"
+        )
+
+# Adicionar outros endpoints conforme necessário (ex: /history)
+```
+
+### 3.4 Implementação do Sistema de Otimizações (`src/optimization/`)
+
+#### `caching.py`: Cache com Redis (Exemplo)
+
+```python
+# src/optimization/caching.py
+import redis.asyncio as aioredis
+import json
+import logging
+from typing import Any, Optional
+from core.config import settings
+
+logger = logging.getLogger(__name__)
+redis_pool = None
+
+async def setup_cache():
+    """Inicializa a conexão com o Redis."""
+    global redis_pool
+    if settings.USE_REDIS_CACHE and settings.REDIS_URL:
+        try:
+            redis_pool = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            await redis_pool.ping()
+            logger.info("Conectado ao Redis para cache.")
+        except Exception as e:
+            logger.error(f"Falha ao conectar ao Redis: {e}. Cache desabilitado.")
+            redis_pool = None
+    else:
+        logger.info("Cache Redis não configurado ou desabilitado.")
+
+async def get_from_cache(key: str) -> Optional[Any]:
+    """Busca um valor do cache Redis."""
+    if not redis_pool: return None
+    try:
+        cached_val = await redis_pool.get(key)
+        if cached_val:
+            logger.debug(f"Cache HIT para key: {key}")
+            return json.loads(cached_val)
+        logger.debug(f"Cache MISS para key: {key}")
+        return None
+    except Exception as e:
+        logger.error(f"Erro ao buscar do cache Redis ({key}): {e}")
+        return None
+
+async def set_in_cache(key: str, value: Any, expire_seconds: int = settings.CACHE_TTL):
+    """Define um valor no cache Redis com expiração."""
+    if not redis_pool: return
+    try:
+        await redis_pool.set(key, json.dumps(value), ex=expire_seconds)
+        logger.debug(f"Valor setado no cache para key: {key} (expira em {expire_seconds}s)")
+    except Exception as e:
+        logger.error(f"Erro ao definir no cache Redis ({key}): {e}")
+
+# Funções adicionais podem ser criadas para cache em memória (cachetools) como fallback
+```
+
+#### `compression.py`: Compressão de Embeddings (PCA)
+
+```python
+# src/optimization/compression.py
+import numpy as np
+from sklearn.decomposition import PCA
+import pickle
+import gzip
+import logging
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
+
+class EmbeddingCompressor:
+    def __init__(self, target_dim: int = settings.EMBEDDING_COMPRESSION_DIM):
+        self.pca: Optional[PCA] = None
+        self.target_dim = target_dim
+        self.is_fitted = False
+        self.original_dim: Optional[int] = None
+        # Carregar modelo PCA pré-treinado se existir
+        self.load_model(settings.EMBEDDING_COMPRESSOR_PATH)
+
+    def fit(self, embeddings: List[List[float]]):
+        """Treina o modelo PCA com um conjunto de embeddings."""
+        if not embeddings: return
+        self.original_dim = len(embeddings[0])
+        target = min(self.target_dim, len(embeddings), self.original_dim)
+        if target < 1:
+             logger.warning("Dimensão alvo inválida ou dados insuficientes para PCA.")
+             return
+        logger.info(f"Treinando PCA para reduzir de {self.original_dim} para {target} dimensões...")
+        self.pca = PCA(n_components=target)
+        self.pca.fit(np.array(embeddings))
+        self.is_fitted = True
+        logger.info(f"PCA treinado. Variância explicada: {sum(self.pca.explained_variance_ratio_):.4f}")
+        self.save_model(settings.EMBEDDING_COMPRESSOR_PATH)
+
+    def compress(self, embedding: List[float]) -> List[float]:
+        """Comprime um único embedding."""
+        if not self.is_fitted or not self.pca:
+            # logger.warning("Compressor PCA não treinado, retornando original.")
+            return embedding
+        if len(embedding) != self.original_dim:
+             logger.warning(f"Dimensão de embedding inesperada ({len(embedding)} vs {self.original_dim}). Retornando original.")
+             return embedding
+
+        compressed = self.pca.transform(np.array(embedding).reshape(1, -1))[0]
+        # Aqui poderia adicionar Product Quantization (requer biblioteca como faiss)
+        return compressed.tolist()
+
+    def decompress(self, compressed_embedding: List[float]) -> List[float]:
+        """Descomprime um embedding (aproximado)."""
+        if not self.is_fitted or not self.pca: return compressed_embedding # Retorna como está se não treinado
+        # Lógica de descompressão PQ viria aqui antes do inverse_transform
+        reconstructed = self.pca.inverse_transform(np.array(compressed_embedding).reshape(1, -1))[0]
+        return reconstructed.tolist()
+
+    def save_model(self, filepath: str):
+        if self.pca:
+            try:
+                with gzip.open(filepath, 'wb') as f:
+                    pickle.dump({'pca': self.pca, 'original_dim': self.original_dim}, f)
+                logger.info(f"Modelo PCA salvo em {filepath}")
+            except Exception as e:
+                logger.error(f"Erro ao salvar modelo PCA: {e}")
+
+    def load_model(self, filepath: str):
+        try:
+            with gzip.open(filepath, 'rb') as f:
+                data = pickle.load(f)
+                self.pca = data['pca']
+                self.original_dim = data['original_dim']
+                self.is_fitted = True
+                logger.info(f"Modelo PCA carregado de {filepath}")
+        except FileNotFoundError:
+            logger.info("Arquivo do modelo PCA não encontrado, será necessário treinar.")
+        except Exception as e:
+            logger.error(f"Erro ao carregar modelo PCA: {e}")
+
+# Instância global ou gerenciada via dependência FastAPI
+embedding_compressor = EmbeddingCompressor()
+
+# TODO: Adicionar lógica para treinar o PCA (ex: offline com amostra de dados)
+```
+
+### 3.6 Sistema de Autenticação (`src/auth/`)
+
+Implementação padrão JWT usando `python-jose` e `passlib`.
+
+```python
+# src/auth/auth.py (resumo)
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict
+from pydantic import BaseModel
+
+from core.config import settings
+from .models import User, UserInDB, TokenData
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token") # Ajuste o URL
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+# --- Simulação de Banco de Dados de Usuários ---
+# Substitua por sua lógica real de banco de dados
+FAKE_USERS_DB = {
+    "testuser": {
+        "username": "testuser",
+        "full_name": "Test User",
+        "email": "test@example.com",
+        "hashed_password": get_password_hash("password"), # Hash da senha 'password'
+        "disabled": False,
+    }
+}
+def get_user_from_db(username: str) -> Optional[UserInDB]:
+    if username in FAKE_USERS_DB:
+        user_dict = FAKE_USERS_DB[username]
+        return UserInDB(**user_dict)
+    return None
+# --- Fim da Simulação ---
+
+def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
+    user = get_user_from_db(username)
+    if not user or not verify_password(password, user.hashed_password):
+        return None
+    if user.disabled:
+        return None
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+
+    user = get_user_from_db(username=token_data.username)
+    if user is None:
+        raise credentials_exception
+    # Retorna um modelo User simples, não UserInDB com hash
+    return User(username=user.username, email=user.email, full_name=user.full_name)
+
+# --- Router para /token ---
+from fastapi import APIRouter
+from .models import Token
+
+router = APIRouter()
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+```
+
+### 3.7 Containerização e Deploy (Exemplo `docker-compose.yml`)
+
+```yaml
+# deployment/docker-compose.yml (Exemplo Simplificado)
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.api
+    ports:
+      - "${API_PORT:-8000}:8000" # Porta da API
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - HUGGING_FACE_API_KEY=${HUGGING_FACE_API_KEY}
+      - QDRANT_URL=http://qdrant:6333 # Aponta para o serviço qdrant
+      - SQLITE_PATH=/data/memory.db # Mapear volume para persistência
+      - OLLAMA_BASE_URL=http://ollama:11434 # Aponta para o serviço ollama
+      - REDIS_URL=redis://redis:6379/0 # Aponta para o serviço redis
+      # ... outras env vars do .env
+    volumes:
+      - ../data:/data # Volume para persistir SQLite DB
+    depends_on:
+      - qdrant
+      - ollama
+      - redis
+    networks:
+      - chatbot_network
+
+  # --- Servidores MCP (Exemplos) ---
+  mcp_filesystem:
+    # Se for um script Python, pode construir uma imagem ou rodar via imagem python
+    # Exemplo usando imagem python e montando o código:
+    image: python:3.11-slim
+    command: ["python", "/app/mcp_servers/filesystem_server/src/server.py", "--allowed-dir", "/shared_files"]
+    volumes:
+      - ..:/app # Monta todo o projeto (ajustar)
+      - shared_files_volume:/shared_files # Volume para arquivos
+    environment:
+       # Env vars específicas do server
+       - PYTHONUNBUFFERED=1 # Para logs aparecerem imediatamente
+    networks:
+      - chatbot_network
+
+  mcp_rag:
+    image: python:3.11-slim
+    command: ["python", "/app/mcp_servers/rag_server/src/server.py"]
+    volumes:
+      - ..:/app
+    environment:
+       - PYTHONUNBUFFERED=1
+       - QDRANT_URL=http://qdrant:6333
+       # Precisa do comando para o embeddings server
+       - EMBEDDINGS_SERVER_CMD='python /app/mcp_servers/embeddings_server/src/server.py'
+    depends_on:
+      - qdrant
+      - mcp_embeddings # Depende do servidor de embeddings
+    networks:
+      - chatbot_network
+
+  mcp_ollama:
+     image: python:3.11-slim
+     command: ["python", "/app/mcp_servers/ollama_server/src/server.py"]
+     volumes:
+       - ..:/app
+     environment:
+        - PYTHONUNBUFFERED=1
+        - OLLAMA_BASE_URL=http://ollama:11434
+     depends_on:
+       - ollama
+     networks:
+       - chatbot_network
+
+  mcp_embeddings: # Exemplo
+     image: python:3.11-slim
+     command: ["python", "/app/mcp_servers/embeddings_server/src/server.py"]
+     volumes:
+        - ..:/app
+     environment:
+        - PYTHONUNBUFFERED=1
+        - OLLAMA_BASE_URL=http://ollama:11434
+     depends_on:
+        - ollama
+     networks:
+        - chatbot_network
+
+  # ... outros serviços MCP
+
+  # --- Dependências ---
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - chatbot_network
+
+  ollama:
+    image: ollama/ollama:latest
+    # Expor porta se necessário acessar de fora do docker
+    # ports:
+    #  - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama # Persistir modelos baixados
+    # Configurar GPU se disponível
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks:
+      - chatbot_network
+
+  redis:
+    image: redis:alpine
+    networks:
+      - chatbot_network
+
+volumes:
+  qdrant_data:
+  ollama_data:
+  shared_files_volume:
+
+networks:
+  chatbot_network:
+    driver: bridge```
+
+## 4. Plano de Implementação (Revisado)
+
+### 4.1 Etapas de Desenvolvimento
+
+1.  **Setup API FastAPI:** (2-3 dias) Criar estrutura `/src/api`, `main.py` básico, routers iniciais, configuração de dependências.
+2.  **Autenticação:** (2-3 dias) Implementar JWT em `src/auth`, proteger endpoints.
+3.  **Integrar Orchestrator/Clients:** (3-4 dias) Adaptar `Orchestrator` e `MCP Clients` para serem gerenciados pelo FastAPI (lifespan/dependências). Conectar endpoints aos métodos do Orchestrator.
+4.  **Implementar Otimizações:**
+    *   **Caching:** (2-3 dias) Integrar Redis/cachetools no `Orchestrator` ou `APIClient`.
+    *   **Compressão Embeddings:** (2-3 dias) Implementar `EmbeddingCompressor`, integrá-lo onde embeddings são gerados/usados (provavelmente `mcp-server-rag` e `mcp-server-memory`). Treinar PCA offline.
+5.  **Monitoramento e Logging:** (1-2 dias) Integrar Prometheus, refinar logging.
+6.  **Documentação API:** (1-2 dias) Gerar e refinar documentação OpenAPI/Swagger.
+7.  **Containerização (Opcional):** (2-3 dias) Criar Dockerfiles, `docker-compose.yml`.
+8.  **Testes API e Fim-a-Fim:** (3-4 dias) Testar endpoints, fluxos completos via API, testes de carga básicos.
+
+### 4.2 Timeline Revisado
+
+-   **Total**: ~18 - 27 dias de trabalho (Foco na API e otimizações).
+
+## 5. Riscos e Mitigações (Atualizado)
+
+| Risco                                | Probabilidade | Impacto | Mitigação                                                                        |
+| :----------------------------------- | :------------ | :------ | :------------------------------------------------------------------------------- |
+| Performance API sob Carga            | Média         | Alto    | Otimizações (cache, async), Testes de Carga, Escalonamento Horizontal (Docker). |
+| Complexidade Gerenciamento Clientes MCP | Média         | Médio   | Usar `lifespan` do FastAPI, Injeção de Dependência clara.                     |
+| Segurança da API Exposta             | Alta          | Crítico | Autenticação robusta, Rate Limiting, Validação Pydantic, HTTPS.                  |
+| Overhead da Compressão/Descompressão | Baixa/Média   | Baixo   | Benchmarking, aplicar compressão apenas onde necessário (ex: armazenamento Qdrant). |
+| Configuração Docker/Compose          | Média         | Médio   | Começar simples, documentar configuração de rede/volumes, usar exemplos.           |
+
+## 6. Conclusão Revisada
+
+A Fase 5 conclui o desenvolvimento do backend, transformando o sistema em uma **API FastAPI robusta e otimizada**, que atua como o **Host MCP** central. A arquitetura modular baseada nos servidores MCP das fases anteriores simplifica a criação da API, permitindo que o FastAPI se concentre na orquestração, segurança e exposição dos endpoints. As otimizações implementadas (cache, compressão) garantem performance e eficiência de custos. O resultado é um backend pronto para produção, bem documentado e preparado para ser consumido por um frontend web moderno.
