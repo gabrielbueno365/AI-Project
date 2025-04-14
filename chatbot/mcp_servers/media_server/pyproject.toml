@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "mcp-server-media"
+version = "0.1.0"
+description = "MCP Server para processamento de áudio e mídia"
+authors = ["ChatbotTeam <info@chatbot.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+mcp = { extras = ["server"], version = "^1.5.0" }
+ffmpeg-python = "^0.2.0"
+httpx = "^0.27.0"
+python-magic = "^0.4.27"
+filetype = "^1.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -112,3 +112,39 @@ class Conversation:
             conversation.add_message(message)
         
         return conversation
+        
+    def to_mcp_format(self) -> Dict[str, Any]:
+        """
+        Converte a conversa para o formato compatível com MCP.
+        Preparação para a futura integração com servidores MCP.
+        
+        Returns:
+            Dicionário no formato MCP
+        """
+        return {
+            "id": self.id,
+            "messages": [msg.to_mcp_message() for msg in self.messages],
+            "metadata": self.metadata,
+        }
+        
+    @classmethod
+    def from_mcp_format(cls, mcp_data: Dict[str, Any]) -> 'Conversation':
+        """
+        Cria uma conversa a partir de dados no formato MCP.
+        
+        Args:
+            mcp_data: Dados da conversa no formato MCP
+            
+        Returns:
+            Nova instância de Conversation
+        """
+        conversation = cls(
+            id=mcp_data.get("id", str(uuid.uuid4())),
+            metadata=mcp_data.get("metadata", {}),
+        )
+        
+        for msg_data in mcp_data.get("messages", []):
+            message = Message.from_mcp_message(msg_data)
+            conversation.add_message(message)
+        
+        return conversation

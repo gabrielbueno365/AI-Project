@@ -84,13 +84,16 @@ Esta fase expande significativamente as capacidades do chatbot, implementando pr
 
 ### 3.2 Stack Tecnológico (Detalhado por Componente)
 
--   **Host Principal**: Python 3.11+, Asyncio, `mcp[cli]`, Poetry.
+-   **Host Principal**: Python 3.11+, Asyncio, Poetry.
+-   **Servidores MCP**: Cada servidor MCP terá seu próprio ambiente Poetry com `pyproject.toml` individualizado.
 -   **`mcp-server-filesystem`**: Python, `FastMCP`, `docling`, `python-magic`.
 -   **`mcp-server-rag`**: Python, `FastMCP`, `qdrant-client`, `langchain-huggingface`.
 -   **`mcp-server-media`**: Python, `FastMCP`, `ffmpeg-python`, `httpx`.
 -   **`mcp-server-embeddings`**: Python, `FastMCP`, `langchain-huggingface`.
 -   **`mcp-server-fetch`**: Node.js (via `npx`).
 -   **Banco Vetorial**: Qdrant (local, via Docker ou binário).
+
+**Nota**: Para detalhes sobre como usar o Poetry no projeto, consulte o guia em `chatbot/docs/architecture/poetry_guide.md`.
 
 ### 3.3 Implementação dos Servidores e Clientes
 
@@ -333,12 +336,11 @@ Adicionar caminhos/comandos para os servidores MCP.
 ```dotenv
 # ... (Chaves de API mantidas) ...
 
-# MCP Server Commands (Exemplos - Ajuste os paths!)
-# Use caminhos absolutos ou garanta que estejam no PATH
-FILESYSTEM_SERVER_CMD='uv run --package mcp-server-filesystem -- --allowed-dir /path/to/user/files' # Exemplo
-RAG_SERVER_CMD='python /path/to/chatbot/mcp_servers/rag_server/src/server.py --qdrant-url http://localhost:6333' # Exemplo
-MEDIA_SERVER_CMD='python /path/to/chatbot/mcp_servers/media_server/src/server.py' # Exemplo
-EMBEDDINGS_SERVER_CMD='python /path/to/chatbot/mcp_servers/embeddings_server/src/server.py' # Exemplo
+# MCP Server Commands usando Poetry para isolar dependências
+FILESYSTEM_SERVER_CMD='cd C:\AI\chatbot\mcp_servers\filesystem_server && poetry run python src\server.py --allowed-dir C:\AI\docs'
+RAG_SERVER_CMD='cd C:\AI\chatbot\mcp_servers\rag_server && poetry run python src\server.py --qdrant-url http://localhost:6333'
+MEDIA_SERVER_CMD='cd C:\AI\chatbot\mcp_servers\media_server && poetry run python src\server.py'
+EMBEDDINGS_SERVER_CMD='cd C:\AI\chatbot\mcp_servers\embeddings_server && poetry run python src\server.py'
 
 # Configurações específicas dos servers (se não passadas via args)
 QDRANT_URL=http://localhost:6333
@@ -346,9 +348,171 @@ QDRANT_COLLECTION=chatbot_knowledge_fase2
 EMBEDDING_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 ```
 
-### 3.6 `pyproject.toml` (Adições para Servidores)
+### 3.6 Gerenciamento de Dependências com Poetry para Servidores MCP
 
-Cada diretório em `/mcp_servers/` terá seu próprio `pyproject.toml` (gerenciado via Poetry ou Hatch) listando suas dependências específicas (ex: `mcp`, `docling`, `qdrant-client`).
+Para gerenciar as dependências de cada servidor MCP de forma isolada e eficiente, serão utilizados arquivos `pyproject.toml` individuais em cada servidor, aproveitando o gerenciamento automático de ambientes virtuais do Poetry:
+
+```bash
+# Estrutura de diretórios para servidores MCP com Poetry
+/mcp_servers/
+  /filesystem_server/
+    pyproject.toml  # Dependências específicas deste servidor
+    /src/
+      server.py
+  /embeddings_server/
+    pyproject.toml  # Dependências específicas deste servidor
+    /src/
+      server.py
+  # ... outros servidores
+```
+
+**Exemplo: `pyproject.toml` para o servidor filesystem:**
+
+```toml
+[tool.poetry]
+name = "mcp-server-filesystem"
+version = "0.1.0"
+description = "MCP Server for Filesystem Operations using Docling"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+mcp = { extras = ["server"], version = "^1.5.0" }
+docling = "^0.1.0"
+python-magic = "^0.4.27"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+```
+
+**Vantagens desta abordagem:**
+
+1. Cada servidor MCP tem seu ambiente virtual isolado gerenciado pelo Poetry
+2. As dependências são declaradas e resolvidas localmente para cada servidor
+3. Não há necessidade de criar manualmente múltiplos ambientes `.venv`
+4. Evita conflitos de dependências entre servidores e com o host principal
+5. Facilita a manutenção e atualização de dependências
+
+**Para utilizar os servidores:**
+
+```bash
+# Instalar dependências para um servidor específico
+cd mcp_servers/filesystem_server
+poetry install
+
+# Executar o servidor usando o ambiente Poetry
+poetry run python src/server.py --allowed-dir C:\AI\docs
+```
+
+Os comandos nos arquivos `.env` devem ser ajustados para usar o Poetry para execução dos servidores:
+
+### 3.7 Testando a Configuração MCP
+
+Antes de desenvolver os servidores MCP reais, é recomendado criar um servidor MCP de teste para verificar que a configuração está funcionando corretamente:
+
+1. Primeiro, crie a estrutura de diretórios e o arquivo `pyproject.toml` para o servidor de teste:
+
+```bash
+mkdir -p mcp_servers/test_server/src
+cd mcp_servers/test_server
+```
+
+```toml
+# mcp_servers/test_server/pyproject.toml
+[tool.poetry]
+name = "mcp-server-test"
+version = "0.1.0"
+description = "Servidor MCP de teste"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+mcp = { extras = ["server"], version = "^1.5.0" }
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+```
+
+2. Crie um servidor MCP simples para teste:
+
+```python
+# mcp_servers/test_server/src/server.py
+from mcp.server.fastmcp import FastMCP, Context
+
+# Cria uma instância do servidor
+mcp = FastMCP(name="Test Server")
+
+@mcp.tool()
+async def hello_world(name: str, ctx: Context) -> str:
+    """Retorna uma mensagem de saudação."""
+    ctx.info(f"Recebida chamada para hello_world com nome: {name}")
+    return f"Olá, {name}! Seu primeiro servidor MCP está funcionando!"
+
+if __name__ == "__main__":
+    mcp.run()  # Inicia o servidor via stdio
+```
+
+3. Instale as dependências usando Poetry:
+
+```bash
+cd mcp_servers/test_server
+poetry install
+```
+
+4. Crie um script para testar o servidor:
+
+```python
+# scripts/test_mcp.py
+import asyncio
+import sys
+import subprocess
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
+
+async def test_mcp_server():
+    # Comando para iniciar o servidor
+    cmd = ["poetry", "run", "python", "mcp_servers/test_server/src/server.py"]
+    
+    # Configurar parâmetros do servidor
+    server_params = StdioServerParameters(command=cmd[0], args=cmd[1:])
+    
+    print("Iniciando servidor MCP...")
+    
+    # Conectar ao servidor
+    try:
+        async with stdio_client(server_params) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                # Inicializar a sessão
+                await session.initialize()
+                
+                print("Servidor MCP iniciado!")
+                
+                # Chamar o tool hello_world
+                result = await session.call_tool("hello_world", {"name": "Desenvolvedor"})
+                
+                # Extrair e mostrar o resultado
+                if result.content and isinstance(result.content[0], types.TextContent):
+                    print(f"Resposta do servidor: {result.content[0].text}")
+                else:
+                    print("Formato de resposta inesperado.")
+    except Exception as e:
+        print(f"Erro ao conectar com o servidor MCP: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(test_mcp_server())
+```
+
+5. Execute o teste a partir da raiz do projeto:
+
+```bash
+python scripts/test_mcp.py
+```
+
+Se tudo estiver funcionando corretamente, você verá a mensagem "Olá, Desenvolvedor! Seu primeiro servidor MCP está funcionando!".
+
+Este teste simples confirma que a instalação do MCP está correta e que a comunicação entre cliente e servidor MCP via stdio está funcionando, antes de implementar os servidores complexos da aplicação.
 
 ## 4. Plano de Implementação (Revisado)
 
@@ -378,7 +542,7 @@ Cada diretório em `/mcp_servers/` terá seu próprio `pyproject.toml` (gerencia
 | Gerenciamento de Múltiplos Servidores       | Média         | Médio   | Scripts para iniciar/parar todos os servers; Considerar Docker Compose futuro. |
 | Dependência de DOCLING/FFmpeg               | Média         | Alto    | Isolar no servidor MCP; Testes de instalação robustos; Alternativas (Tika).    |
 | Performance do Qdrant Local                 | Baixa/Média   | Médio   | Benchmarking inicial; Otimização de índices; Hardware adequado.                |
-| Configuração Correta de Paths (Host/Server) | Média         | Médio   | Usar paths absolutos; Variáveis de ambiente claras; Testes de configuração.    |
+| Conflito de Dependências em Python        | Baixa         | Médio    | **Usar Poetry com `pyproject.toml` separados para cada servidor MCP;** Ver guia de uso. |
 
 ## 6. Conclusão Revisada
 

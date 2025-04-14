@@ -8,7 +8,16 @@ Modelo para representação de mensagens no chatbot.
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
+
+# Preparação para futura compatibilidade com MCP
+# MCP será instalado na Fase 2
+MCP_AVAILABLE = False
+
+# Classes fictícias para compatibilidade
+class TextContent:
+    def __init__(self, text):
+        self.text = text
 
 
 @dataclass
@@ -102,3 +111,49 @@ class Message:
             Nova mensagem do assistente
         """
         return cls(role="assistant", content=content)
+        
+    def to_mcp_message(self) -> Dict[str, Any]:
+        """
+        Converte a mensagem para o formato MCP para integração futura.
+        
+        Returns:
+            Mensagem no formato compatível com MCP
+        """
+        if not MCP_AVAILABLE:
+            return self.to_dict()
+            
+        # Formato básico para futura integração MCP
+        return {
+            "role": self.role,
+            "content": [TextContent(text=self.content)],
+            "metadata": self.metadata,
+        }
+        
+    @classmethod
+    def from_mcp_message(cls, mcp_message: Dict[str, Any]) -> 'Message':
+        """
+        Cria uma mensagem a partir do formato MCP.
+        
+        Args:
+            mcp_message: Mensagem no formato MCP
+            
+        Returns:
+            Nova instância de Message
+        """
+        if not MCP_AVAILABLE:
+            return cls.from_dict(mcp_message)
+            
+        # Extrai o conteúdo como texto
+        content = ""
+        if "content" in mcp_message and isinstance(mcp_message["content"], list):
+            for item in mcp_message["content"]:
+                if hasattr(item, "text"):
+                    content += item.text
+        
+        return cls(
+            role=mcp_message.get("role", "user"),
+            content=content,
+            id=mcp_message.get("id", str(uuid.uuid4())),
+            timestamp=time.time(),
+            metadata=mcp_message.get("metadata", {}),
+        )

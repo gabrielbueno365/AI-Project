@@ -1,96 +1,66 @@
-# Chatbot Inteligente - Fase 1
+# Chatbot Inteligente (Fase 1)
 
-Este projeto implementa um chatbot baseado em terminal com capacidades de IA avançadas, utilizando modelos de linguagem de ponta via APIs.
+Este é um projeto de chatbot inteligente desenvolvido em Python, seguindo uma arquitetura modular que está preparada para evoluir para o Model Context Protocol (MCP).
 
-## Descrição
+## Estado Atual
 
-O chatbot utiliza arquitetura assíncrona e integra-se com diversas APIs de LLM:
+O projeto está na **Fase 1 - Chatbot Básico (Terminal)**, que implementa:
 
-- Fireworks AI via HuggingFace
-- Groq
-- HuggingFace
+- Interface via terminal usando Rich e prompt_toolkit
+- Arquitetura modular com serviços independentes
+- Integração com APIs Groq e Hugging Face para geração de texto
+- Processamento básico de arquivos de áudio para transcrição
+- Gestão de contexto em memória para conversa contextual
+- Inclusão da biblioteca MCP para futura migração
 
-A fase 1 implementa uma base sólida com:
-- Interface de terminal
-- Gerenciamento de contexto de conversas
-- Processamento de linguagem natural básico
-- Sistema de fallback entre APIs
+## Arquitetura
 
-## Instalação e Requisitos
+A arquitetura atual é baseada em componentes modulares Python que se comunicam via chamadas de método assíncronas. Esta abordagem já estabelece separações claras que facilitarão a migração para MCP nas próximas fases.
 
-### Pré-requisitos
+Principais componentes:
 
-- Python 3.11+
-- Poetry (gerenciador de pacotes)
+- **ChatbotApp**: Controlador principal (futuro MCP Host)
+- **NLPService**: Processamento de linguagem natural
+- **APIService**: Comunicação com APIs externas
+- **ContextService**: Gestão do contexto da conversa
+- **AudioService**: Processamento de arquivos de áudio
 
-### Instalação
+A documentação completa da arquitetura está disponível em `docs/architecture/mcp_vision.md`.
 
-1. Clone o repositório:
-   ```
-   git clone <url-do-repositorio>
-   cd chatbot
-   ```
+## Próximas Fases
 
-2. Instale as dependências com Poetry:
-   ```
-   poetry install
-   ```
+1. **Fase 2**: Implementação dos servidores MCP essenciais (RAG, Filesystem, Mídia, Web)
+2. **Fase 3**: Inteligência híbrida e memória MCP (Ollama local + Memória persistente)
+3. **Fase 4**: Agentes MCP e inteligência avançada (Framework de Agentes, Metacognição)
+4. **Fase 5**: API Host MCP (FastAPI) e otimização
 
-3. Configure as credenciais de API:
-   - Crie um arquivo `.env` na raiz do projeto com suas chaves de API:
-   ```
-   HUGGINGFACE_TOKEN=sua_chave_aqui
-   GROQ_API_KEY=sua_chave_aqui
-   OPENAI_API_KEY=sua_chave_aqui
-   GEMINI_API_KEY=sua_chave_aqui
-   ```
+## Instalação
 
-## Execução
+```bash
+# Criar ambiente virtual
+python -m venv .venv
 
-Para iniciar o chatbot:
+# Ativar ambiente (Windows)
+.venv\Scripts\activate
+# OU (Linux/Mac)
+source .venv/bin/activate
 
-```
-poetry run python src/main.py
-```
-
-Ou ative o ambiente virtual e execute:
-
-```
-poetry shell
-python src/main.py
-```
-
-## Estrutura do Projeto
-
-```
-/chatbot
-├── /src                  # Código fonte principal
-│   ├── /core             # Funcionalidades core
-│   ├── /models           # Modelos de dados
-│   ├── /services         # Serviços de API e processamento
-│   ├── /utils            # Utilitários
-│   └── main.py           # Ponto de entrada
-├── /tests                # Testes (a serem implementados)
-├── .env                  # Variáveis de ambiente
-└── README.md             # Este arquivo
+# Instalar dependências via Poetry
+pip install poetry
+poetry install
 ```
 
 ## Uso
 
-- Digite perguntas ou mensagens naturalmente
-- Use o comando "sair" para encerrar o chatbot
+```bash
+python -m src.main
+```
 
-## Recursos Planejados (Próximas Fases)
+## Testes
 
-- Processamento de mídia (áudio, vídeo)
-- Leitura de arquivos
-- RAG (Retrieval-Augmented Generation)
-- Interface web
-- Suporte a múltiplos modelos de IA
-
-## Contribuição
-
-Este projeto segue um plano de desenvolvimento estruturado. Contribuições devem ser alinhadas com o roadmap de fases.
+```bash
+pytest tests/
+```
 
 ## Licença
 
