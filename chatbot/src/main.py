@@ -106,6 +106,12 @@ async def main():
     # Inicializa o app principal
     app = ChatbotApp()
     
+    # Verifica se o servidor MCP de mídia está configurado
+    if app.media_client is not None:
+        console.print("[green]Servidor MCP de mídia configurado e pronto para uso![/green]")
+    else:
+        console.print("[yellow]Aviso: Servidor MCP de mídia não configurado. Usando serviço legado.[/yellow]")
+    
     # Mensagem de boas-vindas
     console.print(
         Panel.fit(

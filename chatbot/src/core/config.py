@@ -9,7 +9,7 @@ Carrega valores de .env e define padrões.
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from functools import lru_cache
 from pydantic import validator, Field
 from pydantic_settings import BaseSettings
@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     max_audio_duration: int = int(os.getenv("MAX_AUDIO_DURATION", "600"))  # 10 min
     whisper_model: str = os.getenv("WHISPER_MODEL", "whisper-large-v3")
     whisper_language: str = os.getenv("WHISPER_LANGUAGE", "pt-BR")
+    allowed_audio_formats: List[str] = [
+        ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", 
+        ".mp4", ".mpeg", ".mpga", ".oga", ".webm"
+    ]
 
     # MCP Server Commands
     media_server_cmd: str = os.getenv("MEDIA_SERVER_CMD", "")

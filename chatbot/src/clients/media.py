@@ -2,25 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Cliente MCP para comunicação com o servidor de mídia.
+Cliente para comunicação com o servidor de mídia.
 Permite transcrição de áudio e extração de áudio de vídeos.
+
+Implemantação alternativa que não depende diretamente do pacote MCP.
 """
 
 import asyncio
+import json
 import logging
+import os
+import shlex
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Dict, Any, List, Optional, Union
-
-from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
 
 logger = logging.getLogger(__name__)
 
 
 class MediaClient:
     """
-    Cliente para o servidor MCP de mídia (mcp-server-media).
+    Cliente para o servidor MCP de mídia.
     
     Este cliente permite:
     - Transcrever arquivos de áudio usando Whisper
@@ -34,8 +37,11 @@ class MediaClient:
         Args:
             command: Comando para iniciar o servidor MCP (ex: ["poetry", "run", "python", "path/to/server.py"])
         """
-        self.server_params = StdioServerParameters(command=command[0], args=command[1:])
-        self._session: Optional[ClientSession] = None
+        self.command = command
+        self._process = None
+        self._stdin = None
+        self._stdout = None
+        self._request_id = 0
     
     @asynccontextmanager
     async def connect(self) -> AsyncIterator['MediaClient']:
@@ -46,30 +52,119 @@ class MediaClient:
             Instância conectada do cliente
         """
         logger.info("Conectando ao servidor MCP de mídia...")
-        async with stdio_client(self.server_params) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                logger.info("Conexão estabelecida com o servidor MCP de mídia")
-                self._session = session
+        
+        try:
+            # Inicia o processo do servidor
+            self._process = await asyncio.create_subprocess_exec(
+                *self.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            self._stdin = self._process.stdin
+            self._stdout = self._process.stdout
+            
+            # Inicializa a conexão
+            await self._send_request("initialize", {})
+            response = await self._read_response()
+            
+            if response.get("status") != "success":
+                raise RuntimeError(f"Falha ao inicializar servidor: {response}")
+                
+            logger.info("Conexão estabelecida com o servidor MCP de mídia")
+            
+            try:
+                yield self
+            finally:
+                # Encerra a conexão
                 try:
-                    yield self
-                finally:
-                    self._session = None
-                    logger.info("Conexão com o servidor MCP de mídia encerrada")
+                    await self._send_request("shutdown", {})
+                except:
+                    pass
+                    
+                # Encerra o processo
+                if self._process:
+                    try:
+                        self._process.terminate()
+                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        self._process.kill()
+                    
+                self._process = None
+                self._stdin = None
+                self._stdout = None
+                logger.info("Conexão com o servidor MCP de mídia encerrada")
+                
+        except Exception as e:
+            logger.error(f"Erro ao conectar com servidor MCP: {str(e)}")
+            
+            # Certifica de limpar os recursos em caso de erro
+            if self._process:
+                try:
+                    self._process.terminate()
+                except:
+                    pass
+                    
+            self._process = None
+            self._stdin = None
+            self._stdout = None
+            raise
     
-    async def _ensure_connected(self) -> ClientSession:
+    async def _send_request(self, method: str, params: Dict[str, Any]) -> None:
         """
-        Garante que o cliente está conectado ao servidor.
+        Envia uma requisição para o servidor.
+        
+        Args:
+            method: Método a ser chamado
+            params: Parâmetros para o método
+        """
+        if not self._stdin:
+            raise RuntimeError("Cliente não conectado")
+            
+        self._request_id += 1
+        
+        request = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params
+        }
+        
+        request_json = json.dumps(request) + "\n"
+        self._stdin.write(request_json.encode())
+        await self._stdin.drain()
+    
+    async def _read_response(self) -> Dict[str, Any]:
+        """
+        Lê uma resposta do servidor.
         
         Returns:
-            Sessão do cliente
+            Resposta como um dicionário
+        """
+        if not self._stdout:
+            raise RuntimeError("Cliente não conectado")
+            
+        line = await self._stdout.readline()
+        if not line:
+            raise RuntimeError("Conexão encerrada pelo servidor")
+            
+        try:
+            response = json.loads(line.decode().strip())
+            return response
+        except json.JSONDecodeError as e:
+            logger.error(f"Erro ao decodificar resposta: {line.decode()}")
+            raise RuntimeError(f"Resposta inválida do servidor: {str(e)}")
+    
+    async def _ensure_connected(self) -> None:
+        """
+        Garante que o cliente está conectado ao servidor.
             
         Raises:
             RuntimeError: Se o cliente não estiver conectado
         """
-        if not self._session:
+        if not self._process or not self._stdin or not self._stdout:
             raise RuntimeError("Cliente não conectado. Use 'async with client.connect():'")
-        return self._session
     
     async def transcribe_audio(self, file_path: Union[str, Path]) -> Dict[str, Any]:
         """
@@ -96,7 +191,7 @@ class MediaClient:
         Raises:
             ValueError: Se houver erro no processamento
         """
-        session = await self._ensure_connected()
+        await self._ensure_connected()
         
         # Normaliza o caminho para garantir formato correto
         path = Path(file_path).resolve()
@@ -106,26 +201,38 @@ class MediaClient:
         
         try:
             # Chama a tool de transcrição
-            result = await session.call_tool(
-                "transcribe_audio", 
-                {"file_uri": file_uri}
+            await self._send_request(
+                "call", 
+                {
+                    "tool": "transcribe_audio",
+                    "params": {"file_uri": file_uri}
+                }
             )
             
+            response = await self._read_response()
+            
+            # Verifica erros na resposta
+            if "error" in response:
+                logger.error(f"Erro do servidor: {response['error']}")
+                raise ValueError(f"Erro do servidor: {response['error']}")
+            
             # Processa o resultado
-            if result.content and isinstance(result.content[0], types.TextContent):
-                import json
+            if "result" in response and isinstance(response["result"], dict):
+                # Se já for um dicionário, retorna como está
+                return response["result"]
+            elif "result" in response and isinstance(response["result"], str):
+                # Se for uma string, tenta fazer parse como JSON
                 try:
-                    # Tenta converter o resultado de texto para dict
-                    return json.loads(result.content[0].text)
+                    return json.loads(response["result"])
                 except json.JSONDecodeError:
-                    # Caso não seja JSON válido, retorna um dict mínimo
+                    # Se não for JSON válido, retorna um dict mínimo
                     return {
                         "type": "audio",
                         "filename": path.name,
-                        "transcription": result.content[0].text
+                        "transcription": response["result"]
                     }
             
-            # Fallback se o formato de resposta for inesperado
+            # Fallback para resposta inesperada
             return {
                 "type": "audio",
                 "filename": path.name,
@@ -136,7 +243,6 @@ class MediaClient:
         except Exception as e:
             logger.error(f"Erro ao transcrever áudio: {str(e)}")
             raise ValueError(f"Falha na transcrição: {str(e)}")
-    
     async def extract_audio(
         self, 
         video_path: Union[str, Path], 
@@ -155,7 +261,7 @@ class MediaClient:
         Raises:
             ValueError: Se houver erro na extração
         """
-        session = await self._ensure_connected()
+        await self._ensure_connected()
         
         # Normaliza o caminho para garantir formato correto
         path = Path(video_path).resolve()
@@ -165,17 +271,27 @@ class MediaClient:
         
         try:
             # Chama a tool de extração
-            result = await session.call_tool(
-                "extract_audio_uri", 
+            await self._send_request(
+                "call", 
                 {
-                    "video_uri": video_uri,
-                    "output_format": output_format
+                    "tool": "extract_audio_uri",
+                    "params": {
+                        "video_uri": video_uri,
+                        "output_format": output_format
+                    }
                 }
             )
             
+            response = await self._read_response()
+            
+            # Verifica erros na resposta
+            if "error" in response:
+                logger.error(f"Erro do servidor: {response['error']}")
+                raise ValueError(f"Erro do servidor: {response['error']}")
+            
             # Processa o resultado
-            if result.content and isinstance(result.content[0], types.TextContent):
-                audio_uri = result.content[0].text
+            if "result" in response and isinstance(response["result"], str):
+                audio_uri = response["result"]
                 
                 # Remove o prefixo "file://" para retornar apenas o caminho
                 if audio_uri.startswith("file://"):
@@ -189,25 +305,3 @@ class MediaClient:
         except Exception as e:
             logger.error(f"Erro ao extrair áudio: {str(e)}")
             raise ValueError(f"Falha na extração de áudio: {str(e)}")
-
-
-# Exemplo de uso
-async def _example_usage():
-    from src.core.config import get_settings
-    settings = get_settings()
-    
-    # Comando para iniciar o servidor MCP de mídia
-    command = settings.media_server_cmd.split()
-    
-    # Cria o cliente
-    client = MediaClient(command)
-    
-    # Usa o cliente
-    async with client.connect():
-        # Transcreve um áudio
-        result = await client.transcribe_audio("/path/to/audio.mp3")
-        print(f"Transcrição: {result['transcription']}")
-        
-        # Extrai áudio de um vídeo
-        audio_path = await client.extract_audio("/path/to/video.mp4")
-        print(f"Áudio extraído: {audio_path}")
